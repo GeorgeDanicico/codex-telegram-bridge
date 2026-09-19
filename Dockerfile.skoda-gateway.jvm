@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.7
+
+# JVM image for the sibling skoda-mcp gateway. The gateway depends on the
+# locally generated skoda-api-client artifact, so build that library first.
+FROM maven:3.9-eclipse-temurin-21 AS builder
+
+WORKDIR /workspace
+
+COPY skoda-api-client/pom.xml skoda-api-client/skoda-api-server.yaml ./skoda-api-client/
+COPY skoda-api-client/src ./skoda-api-client/src
+WORKDIR /workspace/skoda-api-client
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn --batch-mode --no-transfer-progress --quiet \
+      install -DskipTests -Dgpg.skip=true
+
+WORKDIR /workspace
+COPY skoda-mcp/pom.xml ./skoda-mcp/pom.xml
+COPY skoda-mcp/src ./skoda-mcp/src
+WORKDIR /workspace/skoda-mcp
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn --batch-mode --no-transfer-progress --quiet \
+      package -DskipTests -Dgpg.skip=true
+
+FROM eclipse-temurin:21-jre
+
+RUN useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin skoda
+WORKDIR /app
+COPY --from=builder --chown=skoda:skoda /workspace/skoda-mcp/target/skoda-mcp.jar /app/skoda-mcp.jar
+
+USER skoda
+ENV SPRING_PROFILES_ACTIVE=gateway
+EXPOSE 8091
+ENTRYPOINT ["java", "-jar", "/app/skoda-mcp.jar"]

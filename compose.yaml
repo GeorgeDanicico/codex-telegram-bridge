@@ -1,20 +1,37 @@
 services:
+  skoda-api-client:
+    build:
+      context: /home/r3k1Nu/projects/skoda-mcp-server
+      dockerfile: /home/r3k1Nu/projects/codex-telegram-bridge/Dockerfile.skoda-gateway.jvm
+    image: skoda-api-client:jvm
+    env_file:
+      - /home/r3k1Nu/projects/skoda-mcp-server/skoda-mcp/.env
+    environment:
+      SPRING_PROFILES_ACTIVE: gateway
+      SERVER_ADDRESS: 127.0.0.1
+      SERVER_PORT: "8091"
+      SKODA_API_BASE_URL: http://127.0.0.1:8090
+      SKODA_GATEWAY_TOKEN: ${SKODA_GATEWAY_TOKEN:-}
+      SKODA_SNAPSHOT_CACHE_SECONDS: ${SKODA_SNAPSHOT_CACHE_SECONDS:-5}
+      SKODA_SNAPSHOT_TIMEOUT_SECONDS: ${SKODA_REQUEST_TIMEOUT_SECONDS:-18}
+    network_mode: host
+    restart: unless-stopped
 
   codex-telegram-bridge:
     build: .
     image: codex-telegram-bridge:local
-    depends_on:
-      - skoda-mcp
     env_file:
-      - ./.env
+      - /home/r3k1Nu/projects/codex-telegram-bridge/.env
     environment:
-      CODEX_WORKDIR: /workspace
-      PROJECTS_DIR: /home/bridge/Projects
-      SKODA_GATEWAY_URL: http://skoda-mcp:8090
+      HOME: /home/bridge
+      CODEX_HOME: /home/bridge/.codex
+    depends_on:
+      - skoda-api-client
     init: true
+    network_mode: host
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     volumes:
-      - ${HOME}/.codex:/home/bridge/.codex
-      - ${HOME}/Projects:/home/bridge/Projects
+      - ${CODEX_AUTH_DIR:-${HOME}/.codex}:/home/bridge/.codex
+      - ${PROJECTS_HOST_DIR:-..}:/projects:ro
       - ./:/workspace
     restart: unless-stopped

@@ -18,7 +18,7 @@ COPY --chown=bridge:bridge bot.py ./bot.py
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    CODEX_WORKDIR=/workspace
+    HOME=/home/bridge
 
 USER bridge
 ENTRYPOINT ["python3", "/app/bot.py"]

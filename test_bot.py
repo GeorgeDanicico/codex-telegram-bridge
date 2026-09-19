@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from bot import Bridge, CarSnapshot, CodexProfile, Settings
+from bot import Bridge, CodexProfile, CodexRunner, Settings, SkodaGatewayClient
 
 
 class FakeTelegramBot:
@@ -18,11 +18,6 @@ class FakeTelegramBot:
         reply_markup: dict[str, Any] | None = None,
     ) -> None:
         self.calls.append(("message", (chat_id, text, reply_to_message_id, reply_markup)))
-
-    async def send_location(
-        self, chat_id: int, latitude: float, longitude: float, reply_to_message_id: int | None = None
-    ) -> None:
-        self.calls.append(("location", (chat_id, latitude, longitude, reply_to_message_id)))
 
     async def send_typing(self, chat_id: int) -> None:
         self.calls.append(("typing", chat_id))
@@ -40,65 +35,42 @@ class FakeTelegramBot:
 
 
 class FakeCodexRunner:
-    def __init__(self) -> None:
-        self.json_calls: list[tuple[str, dict[str, Any]]] = []
-        self.text_calls: list[str] = []
-
-    async def run_json(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
-        self.json_calls.append((prompt, schema))
-        return {
-            "vehicle_name": "Skoda Enyaq",
-            "license_plate": "B 123 CAR",
-            "range_km": 287,
-            "battery_percent": 72,
-            "doors_locked": "Locked",
-            "doors": "Closed",
-            "windows": "Closed",
-            "trunk": "Closed",
-            "bonnet": "Closed",
-            "lights": "Off",
-            "location_address": "Example Street",
-            "latitude": 44.4268,
-            "longitude": 26.1025,
-            "updated_at": "2026-08-12 10:00 EEST",
-        }
+    def __init__(self, response: str = "Codex response") -> None:
+        self.response = response
+        self.prompts: list[str] = []
 
     async def run(self, prompt: str) -> str:
-        self.text_calls.append(prompt)
-        return "The vehicle lights were flashed successfully."
+        self.prompts.append(prompt)
+        return self.response
 
     async def version(self) -> str:
         return "test"
 
 
-class EmptyFirstSnapshotRunner(FakeCodexRunner):
-    def __init__(self) -> None:
-        super().__init__()
-        self.snapshot_attempts = 0
-
-    async def run_json(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
-        self.snapshot_attempts += 1
-        if self.snapshot_attempts == 1:
-            raise RuntimeError("Codex completed without a final response.")
-        return await super().run_json(prompt, schema)
-
-
-class FakeGateway:
+class FakeCarApi:
     def __init__(self) -> None:
         self.snapshot_calls = 0
         self.actions: list[str] = []
         self.payload: dict[str, Any] = {
-            "vehicleName": "Skoda Enyaq",
+            "vehicleName": "Enyaq",
             "licensePlate": "B 123 CAR",
             "rangeKm": 287,
             "batteryPercent": 72,
             "doorsLocked": "Locked",
+            "locked": "Locked",
             "doors": "Closed",
             "windows": "Closed",
+            "reliableLockStatus": "Reliable",
             "trunk": "Closed",
             "bonnet": "Closed",
             "lights": "Off",
-            "location": {"latitude": 44.4268, "longitude": 26.1025, "address": "Example Street"},
+            "location": {
+                "country": "Belgium",
+                "county": "Brussels-Capital",
+                "latitude": 50.8503,
+                "longitude": 4.3517,
+                "address": "Example Street",
+            },
             "capturedAt": "2026-08-12T10:00:00Z",
             "partial": False,
             "unavailableSections": [],
@@ -115,7 +87,6 @@ class FakeGateway:
 
 def settings(
     allowed_user_ids: frozenset[int] = frozenset({7}),
-    transport: str = "http",
     projects_dir: Path | None = None,
     wiki_workdir: Path | None = None,
 ) -> Settings:
@@ -133,8 +104,7 @@ def settings(
         fast_profile=profile,
         default_profile=profile,
         deep_profile=profile,
-        skoda_transport=transport,  # type: ignore[arg-type]
-        skoda_gateway_url="http://127.0.0.1:8090",
+        skoda_gateway_url="http://127.0.0.1:8091",
         skoda_gateway_token="test-token",
         skoda_request_timeout_seconds=20,
         skoda_snapshot_cache_seconds=5,
@@ -142,58 +112,62 @@ def settings(
     )
 
 
-class CarSnapshotTests(unittest.TestCase):
-    def test_format_includes_basic_status(self) -> None:
-        snapshot = CarSnapshot.from_payload(
-            {
-                "vehicle_name": "Enyaq",
-                "license_plate": None,
-                "range_km": 250.5,
-                "battery_percent": 80,
-                "doors_locked": "Locked",
-                "doors": "Closed",
-                "windows": None,
-                "trunk": None,
-                "bonnet": None,
-                "lights": "Off",
-                "location_address": None,
-                "latitude": None,
-                "longitude": None,
-                "updated_at": None,
-            }
-        )
-
-        self.assertIn("Range: 250.5 km", snapshot.format())
-        self.assertIn("Doors: Closed", snapshot.format())
-        self.assertIn("Location unavailable", snapshot.format())
-
-    def test_rejects_invalid_coordinates(self) -> None:
-        with self.assertRaises(RuntimeError):
-            CarSnapshot.from_payload({"latitude": 91, "longitude": 0})
-
-
-class BridgeCarTests(unittest.IsolatedAsyncioTestCase):
+class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.bot = FakeTelegramBot()
         self.bridge = Bridge(settings(), self.bot)  # type: ignore[arg-type]
         self.codex = FakeCodexRunner()
-        self.bridge._car_codex = self.codex  # type: ignore[assignment]
-        self.gateway = FakeGateway()
-        self.bridge._gateway = self.gateway  # type: ignore[assignment]
+        self.bridge._codex = self.codex  # type: ignore[assignment]
+        self.bridge._fast_codex = self.codex  # type: ignore[assignment]
+        self.bridge._deep_codex = self.codex  # type: ignore[assignment]
+        self.bridge._wiki_codex = self.codex  # type: ignore[assignment]
+        self.car_api = FakeCarApi()
+        self.bridge._car_api = self.car_api  # type: ignore[assignment]
 
-    async def test_car_command_sends_map_summary_and_buttons(self) -> None:
+    async def test_prompt_sends_typing_and_response(self) -> None:
+        await self.bridge.handle_message(
+            {"from": {"id": 7}, "chat": {"id": 99}, "message_id": 12, "text": "Hello bridge"}
+        )
+        await self.bridge._jobs[99]
+
+        self.assertEqual(self.codex.prompts, ["Hello bridge"])
+        self.assertIn(("typing", 99), self.bot.calls)
+        self.assertEqual(
+            [call for call in self.bot.calls if call[0] == "message"][-1][1],
+            (99, "Codex response", 12, None),
+        )
+
+    async def test_commands_are_case_insensitive_and_support_mentions(self) -> None:
+        await self.bridge.handle_message(
+            {"from": {"id": 7}, "chat": {"id": 99}, "message_id": 12, "text": "/quick@test_bridge_bot do it"}
+        )
+        await self.bridge._jobs[99]
+
+        self.assertEqual(self.codex.prompts, ["do it"])
+
+    async def test_access_is_denied_for_users_outside_allowlist(self) -> None:
+        await self.bridge.handle_message(
+            {"from": {"id": 8}, "chat": {"id": 99}, "message_id": 12, "text": "Hello bridge"}
+        )
+
+        self.assertEqual(self.codex.prompts, [])
+        self.assertEqual(
+            [call for call in self.bot.calls if call[0] == "message"][-1][1],
+            (99, "Access denied.", 12, None),
+        )
+
+    async def test_car_sends_text_location_and_controls_without_map(self) -> None:
         await self.bridge.handle_message(
             {"from": {"id": 7}, "chat": {"id": 99}, "message_id": 12, "text": "/car"}
         )
-        job = self.bridge._jobs[99]
-        await job
+        await self.bridge._jobs[99]
 
-        self.assertFalse(self.codex.json_calls, "/car must not invoke Codex when using HTTP")
-        self.assertEqual(self.gateway.snapshot_calls, 1)
-        location = next(call for call in self.bot.calls if call[0] == "location")
-        self.assertEqual(location[1], (99, 44.4268, 26.1025, 12))
+        self.assertEqual(self.car_api.snapshot_calls, 1)
+        self.assertFalse(any(call[0] == "location" for call in self.bot.calls))
         summary = [call for call in self.bot.calls if call[0] == "message"][-1][1]
-        self.assertIn("Range: 287 km", summary[1])
+        self.assertIn("Country: Belgium", summary[1])
+        self.assertIn("County: Brussels-Capital", summary[1])
+        self.assertIn("Coordinates: 50.850300, 4.351700", summary[1])
         callback_data = [
             button["callback_data"]
             for row in summary[3]["inline_keyboard"]
@@ -202,25 +176,16 @@ class BridgeCarTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("car:confirm:honk_flash", callback_data)
         self.assertIn("car:confirm:unlock", callback_data)
 
-    async def test_car_snapshot_uses_short_cache_and_displays_partial_data(self) -> None:
-        self.gateway.payload["partial"] = True
-        self.gateway.payload["unavailableSections"] = ["location"]
-        self.gateway.payload["location"] = {"latitude": None, "longitude": None, "address": None}
+    async def test_car_snapshot_uses_cache(self) -> None:
+        for message_id in (12, 13):
+            await self.bridge.handle_message(
+                {"from": {"id": 7}, "chat": {"id": 99}, "message_id": message_id, "text": "/car"}
+            )
+            await self.bridge._jobs[99]
 
-        await self.bridge.handle_message(
-            {"from": {"id": 7}, "chat": {"id": 99}, "message_id": 12, "text": "/car"}
-        )
-        await self.bridge._jobs[99]
-        await self.bridge.handle_message(
-            {"from": {"id": 7}, "chat": {"id": 99}, "message_id": 13, "text": "/car"}
-        )
-        await self.bridge._jobs[99]
+        self.assertEqual(self.car_api.snapshot_calls, 1)
 
-        self.assertEqual(self.gateway.snapshot_calls, 1)
-        self.assertFalse(any(call[0] == "location" for call in self.bot.calls))
-        self.assertIn("Unavailable: location", [call for call in self.bot.calls if call[0] == "message"][-1][1][1])
-
-    async def test_car_action_requires_confirmation_then_calls_exact_tool(self) -> None:
+    async def test_car_action_requires_confirmation_and_calls_api(self) -> None:
         base_query = {
             "id": "callback-1",
             "from": {"id": 7},
@@ -241,11 +206,9 @@ class BridgeCarTests(unittest.IsolatedAsyncioTestCase):
                 "data": "car:run:flash",
             }
         )
-        job = self.bridge._jobs[99]
-        await job
+        await self.bridge._jobs[99]
 
-        self.assertEqual(self.gateway.actions, ["flash"])
-        self.assertFalse(self.codex.text_calls)
+        self.assertEqual(self.car_api.actions, ["flash"])
         self.assertIn(("remove_keyboard", (99, 51)), self.bot.calls)
 
     async def test_car_is_disabled_without_allowlist(self) -> None:
@@ -259,14 +222,15 @@ class BridgeCarTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(bridge._jobs)
         self.assertIn("disabled", bot.calls[-1][1][1])
 
-    async def test_mcp_fallback_remains_available_for_rollback(self) -> None:
-        bridge = Bridge(settings(transport="mcp"), self.bot)  # type: ignore[arg-type]
-        bridge._car_codex = self.codex  # type: ignore[assignment]
-        await bridge.handle_message(
-            {"from": {"id": 7}, "chat": {"id": 99}, "message_id": 12, "text": "/car"}
+    async def test_help_lists_only_supported_commands(self) -> None:
+        await self.bridge.handle_message(
+            {"from": {"id": 7}, "chat": {"id": 99}, "message_id": 12, "text": "/help"}
         )
-        await bridge._jobs[99]
-        self.assertEqual(len(self.codex.json_calls), 1)
+
+        response = [call for call in self.bot.calls if call[0] == "message"][-1][1][1]
+        self.assertIn("/status", response)
+        self.assertIn("/cancel", response)
+        self.assertIn("/car", response)
 
     async def test_projects_lists_project_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -283,19 +247,15 @@ class BridgeCarTests(unittest.IsolatedAsyncioTestCase):
         response = [call for call in self.bot.calls if call[0] == "message"][-1][1][1]
         self.assertEqual(response, "Projects:\n• alpha\n• zebra")
 
-    async def test_wiki_command_uses_dedicated_wiki_runner(self) -> None:
-        self.bridge._wiki_codex = self.codex  # type: ignore[assignment]
-
+    async def test_wiki_uses_dedicated_runner(self) -> None:
         await self.bridge.handle_message(
             {"from": {"id": 7}, "chat": {"id": 99}, "message_id": 12, "text": "/wiki What is DNS?"}
         )
         await self.bridge._jobs[99]
 
-        self.assertEqual(self.codex.text_calls, ["What is DNS?"])
+        self.assertEqual(self.codex.prompts, ["What is DNS?"])
 
     async def test_status_reports_codex_and_telegram(self) -> None:
-        self.bridge._codex = self.codex  # type: ignore[assignment]
-
         await self.bridge.handle_message(
             {"from": {"id": 7}, "chat": {"id": 99}, "message_id": 12, "text": "/status"}
         )
@@ -303,36 +263,59 @@ class BridgeCarTests(unittest.IsolatedAsyncioTestCase):
         response = [call for call in self.bot.calls if call[0] == "message"][-1][1][1]
         self.assertIn("Codex: online (test)", response)
         self.assertIn("Telegram: online (@test_bridge_bot)", response)
+        self.assertNotIn("transport", response.lower())
 
-    async def test_removed_commands_are_unknown(self) -> None:
-        for command in ("/ask hello", "/echo hello", "/ping"):
-            await self.bridge.handle_message(
-                {"from": {"id": 7}, "chat": {"id": 99}, "message_id": 12, "text": command}
-            )
+    async def test_removed_command_is_unknown(self) -> None:
+        await self.bridge.handle_message(
+            {"from": {"id": 7}, "chat": {"id": 99}, "message_id": 12, "text": "/unknown"}
+        )
 
-        responses = [call[1][1] for call in self.bot.calls if call[0] == "message"]
-        self.assertEqual(responses, ["Unknown command. Use /help."] * 3)
+        self.assertEqual(
+            [call for call in self.bot.calls if call[0] == "message"][-1][1],
+            (99, "Unknown command. Use /help.", 12, None),
+        )
 
 
 class CodexProfileTests(unittest.TestCase):
     def test_command_overrides_model_and_reasoning_effort(self) -> None:
-        from bot import CodexRunner
-
         profile = CodexProfile("gpt-test", "medium", 30)
         command = CodexRunner(settings(), profile).command("/tmp/response")
         self.assertIn("gpt-test", command)
         self.assertIn('model_reasoning_effort="medium"', command)
 
     def test_command_can_use_a_dedicated_working_directory(self) -> None:
-        from bot import CodexRunner
-
-        wiki_workdir = Path(tempfile.gettempdir()) / "llm-wiki"
+        workdir = Path(tempfile.gettempdir()) / "dedicated-workdir"
         profile = CodexProfile("gpt-test", "medium", 30)
-        command = CodexRunner(settings(wiki_workdir=wiki_workdir), profile, wiki_workdir).command(
-            "/tmp/response"
-        )
+        command = CodexRunner(settings(), profile, workdir).command("/tmp/response")
 
-        self.assertEqual(command[command.index("--cd") + 1], str(wiki_workdir))
+        self.assertEqual(command[command.index("--cd") + 1], str(workdir))
+
+
+class SkodaGatewayClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_and_actions_use_gateway_contract(self) -> None:
+        client = SkodaGatewayClient(settings())
+        calls: list[tuple[str, str]] = []
+
+        async def request(method: str, path: str) -> dict[str, Any]:
+            calls.append((method, path))
+            return {"location": {"latitude": 50.8503, "longitude": 4.3517, "address": "Example Street"}}
+
+        client._request = request  # type: ignore[method-assign]
+        payload = await client.snapshot()
+        await client.action("flash")
+        await client.action("honk-and-flash")
+        await client.action("lock")
+
+        self.assertIn("location", payload)
+        self.assertEqual(
+            calls,
+            [
+                ("GET", "/api/v1/car"),
+                ("POST", "/api/v1/car/actions/flash"),
+                ("POST", "/api/v1/car/actions/honk-and-flash"),
+                ("POST", "/api/v1/car/actions/lock"),
+            ],
+        )
 
 
 if __name__ == "__main__":

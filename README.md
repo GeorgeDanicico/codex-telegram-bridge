@@ -1,127 +1,115 @@
 # Codex Telegram Bridge
 
-A deliberately small, dependency-free Telegram bot that long-polls Telegram and passes ordinary text to the authenticated local `codex` CLI.
+This is a small, dependency-free Telegram bot that long-polls Telegram and sends prompts to the authenticated local Codex CLI.
 
-It has these basic bot operations:
+Supported commands:
 
 - `/start`, `/help`, `/status`, `/projects`, `/server`
-- `/wiki <prompt>` to ask, explore, or update the LLM wiki
-- `/car` for Skoda status, range, a Telegram map pin, and vehicle controls
+- `/wiki <prompt>` for questions or updates in the configured workspace
+- `/car` for vehicle status, text-only location details, and confirmed controls
 - `/quick <prompt>` and `/deep <prompt>` for explicit Codex profiles
-- `/cancel` to stop the active request for that chat
+- `/cancel` to stop the active request for a chat
 
-## Setup
+Ordinary text is sent to Codex as a prompt too.
 
-1. Create a Telegram bot with `@BotFather` and copy its token.
-2. In [.env](.env), replace `PASTE_TOKEN_FROM_BOTFATHER` with that token.
-3. Start the bridge:
+## Configuration
 
-   ```bash
-   cd /home/george/codex-telegram-bridge
-   python3 bot.py
-   ```
+Create the private environment file and fill in the bot token:
 
-The bridge calls the already-authenticated local Codex CLI, so it does not need an `OPENAI_API_KEY`.
+```bash
+cp .env.example .env
+chmod 600 .env
+```
 
-## Docker
+The process environment takes precedence over values in `.env`. The important settings are:
 
-The image includes Python and the Codex CLI, while keeping the Telegram token, Skoda gateway token, and Codex login outside the image. Build it with:
+- `TELEGRAM_BOT_TOKEN`: token from `@BotFather`.
+- `TELEGRAM_ALLOWED_USER_IDS`: optional comma-separated allowlist. Leave it blank to allow every Telegram user who can reach the bot.
+- `CODEX_WORKDIR`: directory passed to Codex for normal prompts.
+- `PROJECTS_DIR`: directory listed by `/projects`.
+- `WIKI_WORKDIR`: directory passed to Codex for `/wiki`.
+- `CODEX_BIN`, `CODEX_MODEL`, `CODEX_TIMEOUT_SECONDS`, and `CODEX_UNSAFE_MODE`.
+- `CODEX_FAST_*`, `CODEX_DEFAULT_*`, and `CODEX_DEEP_*` for profile-specific model and reasoning settings.
+- `SKODA_GATEWAY_URL`, `SKODA_GATEWAY_TOKEN`, `SKODA_REQUEST_TIMEOUT_SECONDS`, `SKODA_SNAPSHOT_CACHE_SECONDS`, and `SKODA_ACTION_COOLDOWN_SECONDS` for `/car`.
+- The JVM gateway reads `SKODA_EMAIL`, `SKODA_PASSWORD`, `SKODA_VIN`, and `SKODA_SPIN` from `/home/r3k1Nu/projects/skoda-mcp-server/skoda-mcp/.env.local` in Compose. Those values stay out of the Telegram bridge container.
+
+The checked-in example uses paths inside the container: `/workspace` for this checkout and `/projects` for the mounted parent directory. Use paths that exist in the environment where the bridge runs. Both the bridge and the JVM gateway use host networking because the existing `api-skoda` deployment publishes its application API on host loopback port `8090`.
+
+## Docker Compose
+
+The Compose service reads the application settings from `.env`; it does not replace them with hard-coded application values. It mounts:
+
+- the checkout at `/workspace`;
+- the checkout's parent directory, read-only, at `/projects`;
+  - the host Codex login directory at `/home/bridge/.codex`.
+
+Start it with the host user's UID and GID so Codex can use the mounted login directory and keep generated files owned by you:
+
+```bash
+LOCAL_UID="$(id -u)" LOCAL_GID="$(id -g)" docker compose up --build -d
+docker compose logs -f codex-telegram-bridge
+```
+
+Stop it with:
+
+```bash
+docker compose down
+```
+
+Set `CODEX_AUTH_DIR` or `PROJECTS_HOST_DIR` in the Compose environment when the host directories differ from `$HOME/.codex` and the checkout's parent directory. These are host-side mount sources; `CODEX_WORKDIR`, `PROJECTS_DIR`, and `WIKI_WORKDIR` remain the paths visible inside the container.
+
+The image does not contain `.env` or Codex credentials. Compose passes the values at runtime through `env_file`, and the Codex login is supplied through the mounted host directory. Log in to Codex on the host before starting the service.
+
+The `/car` command calls the sibling JVM `skoda-mcp` gateway, which uses the `skoda-api-client` OpenAPI-generated Java client and its token service. It sends vehicle status, range, address, and latitude/longitude as text; it never sends a Telegram map message. Flash, honk-and-flash, lock, and unlock require a second confirmation tap. The gateway owns the MySkoda credentials and S-PIN.
+
+### Skoda gateway setup
+
+`skoda-api-client` is a Maven library, so the Compose service builds and runs the sibling `skoda-mcp` Spring Boot gateway in a JVM container. Before starting the stack, fill the real account values in:
+
+```text
+/home/r3k1Nu/projects/skoda-mcp-server/skoda-mcp/.env.local
+```
+
+That file must contain non-placeholder values for `SKODA_EMAIL`, `SKODA_PASSWORD`, `SKODA_VIN`, and the four-digit `SKODA_SPIN`. Set the same non-empty `SKODA_GATEWAY_TOKEN` in this bridge's `/home/r3k1Nu/projects/codex-telegram-bridge/.env`; Compose passes that value to both the bot and the gateway. Keep the existing `api-skoda` container running on `127.0.0.1:8090`.
+
+Start or redeploy the bot and JVM gateway from this directory with:
+
+```bash
+LOCAL_UID="$(id -u)" LOCAL_GID="$(id -g)" docker compose up --build -d
+```
+
+The gateway listens on `127.0.0.1:8091`. In Telegram, send `/car`, then use Refresh for a text snapshot or confirm one of the Flash lights, Honk + flash, Lock, or Unlock actions. No map is sent; location is rendered as address and coordinates when available.
+
+## Docker without Compose
 
 ```bash
 docker build --build-arg CODEX_VERSION=latest -t codex-telegram-bridge .
-```
-
-Run it with the bridge configuration, your existing Codex login, and the directory Codex may work in. The `--user` flag makes files created by Codex retain your host ownership.
-
-```bash
 docker run --rm --init \
   --name codex-telegram-bridge \
   --user "$(id -u):$(id -g)" \
   --env-file .env \
-  -e CODEX_WORKDIR=/workspace \
-  -e PROJECTS_DIR=/home/bridge/Projects \
-  -e SKODA_GATEWAY_URL=http://host.docker.internal:8090 \
-  --add-host=host.docker.internal:host-gateway \
+  -e HOME=/home/bridge \
+  -e CODEX_HOME=/home/bridge/.codex \
   -v "$HOME/.codex:/home/bridge/.codex" \
-  -v "$HOME/Projects:/home/bridge/Projects" \
+  -v "$PWD/..:/projects:ro" \
   -v "$PWD:/workspace" \
   codex-telegram-bridge
 ```
 
-This example reaches a Skoda gateway running on the Docker host. If the gateway runs in another container, put both services on the same Docker network and set `SKODA_GATEWAY_URL` to that container's service name instead. Do not run the container alongside the systemd bridge service: Telegram permits only one long-poller per bot token.
-
-### Complete Docker Compose stack
-
-`compose.yaml` builds native images from `/home/george/Projects/skoda-mcp-server` for `api-skoda` and `skoda-mcp`, then starts this bridge image against the gateway service. Prepare the gateway secrets without adding them to Git:
-
-```bash
-cp skoda-gateway.env.example skoda-gateway.env
-chmod 600 skoda-gateway.env
-# Edit skoda-gateway.env with your MySkoda credentials and gateway token.
-```
-
-Start the stack (the native-image builds can take several minutes the first time):
-
-```bash
-LOCAL_UID="$(id -u)" LOCAL_GID="$(id -g)" docker compose up --build
-```
-
-The Compose services publish the API, its health endpoint, and gateway only on loopback ports `8080`, `8888`, and `8090`. The bridge uses the internal `skoda-mcp:8090` address and mounts `~/Projects` at `/home/bridge/Projects`, so `/projects` lists the host project folders. To use a Skoda source checkout elsewhere, set `SKODA_SOURCE_DIR` to its absolute path. To use an alternate gateway credentials file, set `SKODA_GATEWAY_ENV_FILE`.
-
-## Execution and access
-
-`CODEX_UNSAFE_MODE=true` is set in `.env` as requested. Each prompt then runs Codex with `--dangerously-bypass-approvals-and-sandbox`, which gives it unrestricted local execution.
-
-`TELEGRAM_ALLOWED_USER_IDS` is blank by default, so any Telegram account that can message the bot can submit prompts. That combination is equivalent to giving those accounts unrestricted access to this machine through Codex. To limit access to you, put your numeric Telegram ID in `TELEGRAM_ALLOWED_USER_IDS` before starting the bot.
-
-The bot intentionally keeps no chat memory: every Codex request is an independent `codex exec --ephemeral` run. This keeps the initial communication test simple and predictable.
-
-`/wiki <prompt>` runs Codex in `WIKI_WORKDIR`, which defaults to `PROJECTS_DIR/llm-wiki`. Codex discovers that repository's `AGENTS.md`, so ordinary questions use its inquiry workflow while explicit requests to save or remember something use its capture workflow. Wiki requests are stateless; include the relevant question or context in each follow-up.
-
-`/server` reports OS type, sampled CPU usage, RAM usage and available memory, CPU temperature, and available space on `/`. CPU temperature is shown as `unavailable` when the host does not expose a readable thermal sensor, which is common on virtual machines and non-Linux systems.
-
-`/car` uses the authenticated local Skoda HTTP gateway by default. It does not start Codex or ask a model to select tools. The gateway aggregates the configured vehicle's identity, range, battery level, door/window/lock state, and location; when coordinates are available Telegram displays a native map card. The summary includes Refresh, Flash lights, Honk + flash, Lock, and Unlock buttons. Commands that affect the vehicle require a second confirmation tap and are never retried automatically.
-
-For safety, `/car` and all car-control callbacks are disabled unless `TELEGRAM_ALLOWED_USER_IDS` contains at least one numeric Telegram user ID. Keep that allowlist restricted to people who are authorized to view and control the vehicle.
-
-Configure the gateway with `SKODA_TRANSPORT=http`, `SKODA_GATEWAY_URL`, `SKODA_GATEWAY_TOKEN`, `SKODA_REQUEST_TIMEOUT_SECONDS`, and `SKODA_SNAPSHOT_CACHE_SECONDS`. `SKODA_TRANSPORT=mcp` remains as a temporary read/action rollback path while migrating the local gateway; it should not be the normal configuration.
-
-Codex-backed requests use explicit profiles: `/quick` selects `CODEX_FAST_MODEL` and low reasoning, ordinary text and `/wiki` select `CODEX_DEFAULT_MODEL` and medium reasoning, and `/deep` selects `CODEX_DEEP_MODEL` and high reasoning. The runner passes both the model and `model_reasoning_effort`, so a fast model never accidentally inherits a high global reasoning setting.
-
-If the bot previously had a webhook configured, remove the webhook before using long polling:
+Do not run another long-polling instance with the same bot token at the same time. If the bot previously used a webhook, remove it before starting polling:
 
 ```bash
 curl -X POST "https://api.telegram.org/bot<your-token>/deleteWebhook"
 ```
 
-## Local services
+## Safety
 
-Copy `.env.example` to `~/.config/codex-telegram-bridge/bridge.env` and put the MySkoda credentials plus the same random gateway token in `~/.config/codex-telegram-bridge/skoda-gateway.env` (mode `0600`). The service templates are in `systemd/`. The local API proxy on port 8080 must run before the gateway on port 8090. After building both Java projects, install the units and run `systemctl --user daemon-reload && systemctl --user enable --now api-skoda.service skoda-gateway.service codex-telegram-bridge.service`.
+`CODEX_UNSAFE_MODE=true` grants Codex unrestricted execution inside the container. Keep `TELEGRAM_ALLOWED_USER_IDS` restricted when the bot is exposed to other Telegram users. The container has access to the mounted workspace and Codex login directory, so treat the bot token and environment file as secrets.
 
-Do not run `bot.py` manually while the service is active: Telegram permits only one long-poller per bot token.
+## Checks
 
-For a manual development run, use three terminals in this order:
-
-```bash
-# Terminal 1: local API proxy
-cd /home/george/Projects/skoda-mcp-server/api-skoda
-mvn spring-boot:run
-
-# Terminal 2: aggregate gateway
-cd /home/george/Projects/skoda-mcp-server/skoda-mcp
-set -a
-source ~/.config/codex-telegram-bridge/skoda-gateway.env
-set +a
-mvn spring-boot:run -Dspring-boot.run.profiles=gateway
-
-# Terminal 3: Telegram bridge
-cd /home/george/codex-telegram-bridge
-python3 bot.py
-```
-
-Verify ports `8080` and `8090` before testing `/car`:
+Run the unit tests locally with:
 
 ```bash
-curl http://127.0.0.1:8888/actuator/health
-curl http://127.0.0.1:8090/actuator/health
+python3 -m unittest -v
 ```
