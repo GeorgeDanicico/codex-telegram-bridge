@@ -1,0 +1,20 @@
+services:
+
+  codex-telegram-bridge:
+    build: .
+    image: codex-telegram-bridge:local
+    depends_on:
+      - skoda-mcp
+    env_file:
+      - ./.env
+    environment:
+      CODEX_WORKDIR: /workspace
+      PROJECTS_DIR: /home/bridge/Projects
+      SKODA_GATEWAY_URL: http://skoda-mcp:8090
+    init: true
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    volumes:
+      - ${HOME}/.codex:/home/bridge/.codex
+      - ${HOME}/Projects:/home/bridge/Projects
+      - ./:/workspace
+    restart: unless-stopped
