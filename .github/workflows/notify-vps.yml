@@ -1,0 +1,23 @@
+name: Notify VPS deployments
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake the central deployment workflow
+        env:
+          GH_TOKEN: ${{ secrets.VPS_DISPATCH_TOKEN }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::warning::VPS_DISPATCH_TOKEN is not set; vps-apps will pick up this commit on its next scheduled sync."
+            exit 0
+          fi
+          gh api --method POST repos/GeorgeDanicico/vps-apps/dispatches \
+            -f event_type=upstream-changed
